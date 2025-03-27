@@ -354,6 +354,38 @@ class VLChatProcessor(ProcessorMixin):
 
         return prepare
 
+    def process_batch(
+        self,
+        prompt_batch: List[str] = None,
+        conversations_batch: List[List[Dict[str, str]]] = None,
+        images_batch: List[List[Image]] = None
+    ):
+        assert (
+            prompt_batch is None or conversations_batch is None
+        ), "prompt_batch and conversations_batch cannot be used at the same time."
+
+        prepare = []
+        if prompt_batch is None:
+            for conversations, images in zip(conversations_batch, images_batch):
+                prepare.append(
+                    self.process_one(
+                        conversations=conversations, images=images, force_batchify=False
+                    )
+                )
+
+        else:
+            for prompt, images in zip(prompt_batch, images_batch):
+                prepare.append(
+                    self.process_one(
+                        prompt=prompt, images=images, force_batchify=False
+                    )
+                )
+
+        prepare = self.batchify(prepare)
+
+        return prepare
+
+
     def batchify(
         self, prepare_list: List[VLChatProcessorOutput]
     ) -> BatchedVLChatProcessorOutput:

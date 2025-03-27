@@ -18,6 +18,8 @@
 # CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
 import torch
+import torch.nn as nn
+import torch.nn.functional as F
 from attrdict import AttrDict
 from einops import rearrange
 from transformers import (
@@ -50,6 +52,25 @@ class vision_head(torch.nn.Module):
         x = self.vision_head(x)
         return x
 
+def causal_lm_loss(
+    logits,
+    labels,
+    vocab_size: int,
+    ignore_index: int = -100,
+    num_items_in_batch: int = None,
+):
+    logits = logits.float()
+    labels = labels.to(logits.device)
+
+    # Shift logits and labels for next-token prediction
+    shift_logits = logits[..., :-1, :].contiguous()
+    shift_labels = labels[..., 1:].contiguous()
+
+    shift_logits = shift_logits.view(-1, vocab_size)
+    shift_labels = shift_labels.view(-1)
+
+    loss = F.cross_entropy(shift_logits, shift_labels, ignore_index=ignore_index)
+    return loss
 
 def model_name_to_cls(cls_name):
     if "MlpProjector" in cls_name:
@@ -217,6 +238,7 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
         language_config = config.language_config
         self.language_model = LlamaForCausalLM(language_config)
+        self.und_loss_function = nn.CrossEntropyLoss(ignore_index=-100)
 
     def prepare_inputs_embeds(
         self,
@@ -261,6 +283,63 @@ class MultiModalityCausalLM(MultiModalityPreTrainedModel):
 
     def prepare_gen_img_embeds(self, image_ids: torch.LongTensor):
         return self.gen_aligner(self.gen_embed(image_ids))
+    
+    def forward_und(
+        self,
+        input_ids=None,
+        pixel_values=None,
+        attention_mask=None,
+        images_seq_mask=None,
+        images_emb_mask=None,
+        labels=None,
+        **kwargs
+    ):
+        """
+        Forward pass of multimodal understanding.
+
+        Args:
+            input_ids (torch.LongTensor): Tokenized text input [batch_size, seq_len]
+            pixel_values (torch.FloatTensor): Image tensors [batch_size, num_images, 3, height, width]
+            images_seq_mask (torch.BoolTensor): Mask for image embeddings in the sequence
+            images_emb_mask (torch.BoolTensor): Mask for image embeddings
+            labels (torch.LongTensor, optional): Target labels for loss computation
+
+        Returns:
+            dict: Contains loss (if labels are provided) and logits
+        """
+
+        # Generate embeddings for inputs
+        inputs_embeds = self.prepare_inputs_embeds(input_ids, pixel_values, images_seq_mask, images_emb_mask)
+
+        # Get model output
+        outputs = self.language_model(inputs_embeds=inputs_embeds, attention_mask=attention_mask)
+        logits = outputs.logits
+
+        labels = input_ids.clone()
+        labels[labels == 100594] = -100
+
+        # assistant_token_id = 100602
+        # for i in range(input_ids.size(0)):
+        #     input_seq = input_ids[i]
+        #     # Find where <|Assistant|>: occurs
+        #     positions = (input_seq == assistant_token_id).nonzero(as_tuple=True)[0]
+        #     if len(positions) > 0:
+        #         start = positions[0].item() + 1  # mask before and including assistant
+        #         labels[i, :start] = -100
+        #     else:
+        #         labels[i, :] = -100  # fallback: mask entire row
+
+        # Compute loss if labels are provided
+        loss = None
+        if labels is not None:
+            loss = causal_lm_loss(
+                logits=logits,
+                labels=labels,
+                vocab_size=logits.size(-1),
+                ignore_index=-100,
+            )
+
+        return {"loss": loss, "logits": outputs.logits}
 
 
 AutoConfig.register("vision", VisionConfig)
